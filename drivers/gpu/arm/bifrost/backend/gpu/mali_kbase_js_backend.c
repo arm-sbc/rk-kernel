@@ -1,6 +1,6 @@
 /*
  *
- * (C) COPYRIGHT 2014-2017 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2014-2020 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -27,16 +27,18 @@
 
 #include <mali_kbase.h>
 #include <mali_kbase_hwaccess_jm.h>
+#include <mali_kbase_reset_gpu.h>
 #include <backend/gpu/mali_kbase_jm_internal.h>
 #include <backend/gpu/mali_kbase_js_internal.h>
 
+#if !MALI_USE_CSF
 /*
  * Hold the runpool_mutex for this
  */
 static inline bool timer_callback_should_run(struct kbase_device *kbdev)
 {
 	struct kbase_backend_data *backend = &kbdev->hwaccess.backend;
-	s8 nr_running_ctxs;
+	int nr_running_ctxs;
 
 	lockdep_assert_held(&kbdev->js_data.runpool_mutex);
 
@@ -68,10 +70,10 @@ static inline bool timer_callback_should_run(struct kbase_device *kbdev)
 		 * don't check KBASEP_JS_CTX_ATTR_NON_COMPUTE).
 		 */
 		{
-			s8 nr_compute_ctxs =
+			int nr_compute_ctxs =
 				kbasep_js_ctx_attr_count_on_runpool(kbdev,
 						KBASEP_JS_CTX_ATTR_COMPUTE);
-			s8 nr_noncompute_ctxs = nr_running_ctxs -
+			int nr_noncompute_ctxs = nr_running_ctxs -
 							nr_compute_ctxs;
 
 			return (bool) (nr_compute_ctxs >= 2 ||
@@ -116,7 +118,7 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 			if (!kbase_hw_has_issue(kbdev, BASE_HW_ISSUE_5736)) {
 				u32 ticks = atom->ticks++;
 
-#ifndef CONFIG_MALI_JOB_DUMP
+#if !defined(CONFIG_MALI_JOB_DUMP) && !defined(CONFIG_MALI_VECTOR_DUMP)
 				u32 soft_stop_ticks, hard_stop_ticks,
 								gpu_reset_ticks;
 				if (atom->core_req & BASE_JD_REQ_ONLY_COMPUTE) {
@@ -129,10 +131,15 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 				} else {
 					soft_stop_ticks =
 						js_devdata->soft_stop_ticks;
-					hard_stop_ticks =
-						js_devdata->hard_stop_ticks_ss;
-					gpu_reset_ticks =
-						js_devdata->gpu_reset_ticks_ss;
+					if (kbase_is_quick_reset_enabled(kbdev)) {
+						hard_stop_ticks = 2;
+						gpu_reset_ticks = 3;
+					} else {
+						hard_stop_ticks =
+							js_devdata->hard_stop_ticks_ss;
+						gpu_reset_ticks =
+							js_devdata->gpu_reset_ticks_ss;
+					}
 				}
 
 				/* If timeouts have been changed then ensure
@@ -192,9 +199,10 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 					int ms =
 						js_devdata->scheduling_period_ns
 								/ 1000000u;
-					dev_warn(kbdev->dev, "JS: Job Hard-Stopped (took more than %lu ticks at %lu ms/tick)",
-							(unsigned long)ticks,
-							(unsigned long)ms);
+					if (!kbase_is_quick_reset_enabled(kbdev))
+						dev_warn(kbdev->dev, "JS: Job Hard-Stopped (took more than %lu ticks at %lu ms/tick)",
+								(unsigned long)ticks,
+								(unsigned long)ms);
 					kbase_job_slot_hardstop(atom->kctx, s,
 									atom);
 #endif
@@ -250,14 +258,15 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 			}
 		}
 	}
-#if KBASE_GPU_RESET_EN
 	if (reset_needed) {
-		dev_err(kbdev->dev, "JS: Job has been on the GPU for too long (JS_RESET_TICKS_SS/DUMPING timeout hit). Issueing GPU soft-reset to resolve.");
+		if (kbase_is_quick_reset_enabled(kbdev))
+			dev_err(kbdev->dev, "quick reset");
+		else
+			dev_err(kbdev->dev, "JS: Job has been on the GPU for too long (JS_RESET_TICKS_SS/DUMPING timeout hit). Issuing GPU soft-reset to resolve.");
 
 		if (kbase_prepare_to_reset_gpu_locked(kbdev))
 			kbase_reset_gpu_locked(kbdev);
 	}
-#endif /* KBASE_GPU_RESET_EN */
 	/* the timer is re-issued if there is contexts in the run-pool */
 
 	if (backend->timer_running)
@@ -271,9 +280,11 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 
 	return HRTIMER_NORESTART;
 }
+#endif /* !MALI_USE_CSF */
 
 void kbase_backend_ctx_count_changed(struct kbase_device *kbdev)
 {
+#if !MALI_USE_CSF
 	struct kbasep_js_device_data *js_devdata = &kbdev->js_data;
 	struct kbase_backend_data *backend = &kbdev->hwaccess.backend;
 	unsigned long flags;
@@ -302,29 +313,38 @@ void kbase_backend_ctx_count_changed(struct kbase_device *kbdev)
 			HR_TIMER_DELAY_NSEC(js_devdata->scheduling_period_ns),
 							HRTIMER_MODE_REL);
 
-		KBASE_TRACE_ADD(kbdev, JS_POLICY_TIMER_START, NULL, NULL, 0u,
-									0u);
+		KBASE_KTRACE_ADD_JM(kbdev, JS_POLICY_TIMER_START, NULL, NULL, 0u, 0u);
 	}
+#else /* !MALI_USE_CSF */
+	CSTD_UNUSED(kbdev);
+#endif /* !MALI_USE_CSF */
 }
 
 int kbase_backend_timer_init(struct kbase_device *kbdev)
 {
+#if !MALI_USE_CSF
 	struct kbase_backend_data *backend = &kbdev->hwaccess.backend;
 
 	hrtimer_init(&backend->scheduling_timer, CLOCK_MONOTONIC,
 							HRTIMER_MODE_REL);
 	backend->scheduling_timer.function = timer_callback;
-
 	backend->timer_running = false;
+#else /* !MALI_USE_CSF */
+	CSTD_UNUSED(kbdev);
+#endif /* !MALI_USE_CSF */
 
 	return 0;
 }
 
 void kbase_backend_timer_term(struct kbase_device *kbdev)
 {
+#if !MALI_USE_CSF
 	struct kbase_backend_data *backend = &kbdev->hwaccess.backend;
 
 	hrtimer_cancel(&backend->scheduling_timer);
+#else /* !MALI_USE_CSF */
+	CSTD_UNUSED(kbdev);
+#endif /* !MALI_USE_CSF */
 }
 
 void kbase_backend_timer_suspend(struct kbase_device *kbdev)

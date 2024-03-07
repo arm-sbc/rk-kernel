@@ -76,7 +76,7 @@ static void dw_mci_rk3288_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 	}
 
 	/* Make sure we use phases which we can enumerate with */
-	if (!IS_ERR(priv->sample_clk))
+	if (!IS_ERR(priv->sample_clk) && ios->timing <= MMC_TIMING_SD_HS)
 		clk_set_phase(priv->sample_clk, priv->default_sample_phase);
 }
 
@@ -99,7 +99,7 @@ static int dw_mci_rk3288_execute_tuning(struct dw_mci_slot *slot, u32 opcode)
 	unsigned int range_count = 0;
 	int longest_range_len = -1;
 	int longest_range = -1;
-	int middle_phase;
+	int middle_phase, real_middle_phase;
 
 	if (IS_ERR(priv->sample_clk)) {
 		dev_err(host->dev, "Tuning clock (sample_clk) not defined.\n");
@@ -112,6 +112,9 @@ static int dw_mci_rk3288_execute_tuning(struct dw_mci_slot *slot, u32 opcode)
 
 	/* Try each phase and extract good ranges */
 	for (i = 0; i < NUM_PHASES; ) {
+		/* Cannot guarantee any phases larger than 270 would work well */
+		if (TUNING_ITERATION_TO_PHASE(i) > 270)
+			break;
 		clk_set_phase(priv->sample_clk, TUNING_ITERATION_TO_PHASE(i));
 
 		v = !mmc_send_tuning(mmc, opcode, NULL);
@@ -191,11 +194,30 @@ static int dw_mci_rk3288_execute_tuning(struct dw_mci_slot *slot, u32 opcode)
 
 	middle_phase = ranges[longest_range].start + longest_range_len / 2;
 	middle_phase %= NUM_PHASES;
-	dev_info(host->dev, "Successfully tuned phase to %d\n",
-		 TUNING_ITERATION_TO_PHASE(middle_phase));
+	real_middle_phase = TUNING_ITERATION_TO_PHASE(middle_phase);
 
-	clk_set_phase(priv->sample_clk,
-		      TUNING_ITERATION_TO_PHASE(middle_phase));
+	/*
+	 * Since we cut out 270 ~ 360, the original algorithm
+	 * still rolling ranges before and after 270 together
+	 * in some corner cases, we should adjust it to avoid
+	 * using any middle phase located between 270 and 360.
+	 * By calculatiion, it happends due to the bad phases
+	 * lay between 90 ~ 180. So others are all fine to chose.
+	 * Pick 270 is a better choice in those cases. In case of
+	 * bad phases exceed 180, the middle phase of rollback
+	 * would be bigger than 315, so we chose 360.
+	 */
+	if (real_middle_phase > 270) {
+		if (real_middle_phase < 315)
+			real_middle_phase = 270;
+		else
+			real_middle_phase = 360;
+	}
+
+	dev_info(host->dev, "Successfully tuned phase to %d\n",
+		 real_middle_phase);
+
+	clk_set_phase(priv->sample_clk, real_middle_phase);
 
 free:
 	kfree(ranges);

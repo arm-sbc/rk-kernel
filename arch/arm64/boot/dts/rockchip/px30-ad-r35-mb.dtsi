@@ -187,7 +187,7 @@
 			vdd_logic: DCDC_REG1 {
 				regulator-always-on;
 				regulator-boot-on;
-				regulator-min-microvolt = <950000>;
+				regulator-min-microvolt = <850000>;
 				regulator-max-microvolt = <1350000>;
 				regulator-ramp-delay = <6001>;
 				regulator-initial-mode = <0x1>;
@@ -202,7 +202,7 @@
 			vdd_arm: DCDC_REG2 {
 				regulator-always-on;
 				regulator-boot-on;
-				regulator-min-microvolt = <950000>;
+				regulator-min-microvolt = <850000>;
 				regulator-max-microvolt = <1350000>;
 				regulator-ramp-delay = <6001>;
 				regulator-initial-mode = <0x1>;
@@ -381,6 +381,32 @@
 			};
 		};
 	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	rk618: rk618@50 {
+		reg = <0x50>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <12 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2s1_2ch_mclk>;
+		assigned-clocks = <&cru SCLK_I2S1_OUT>;
+		assigned-clock-rates = <11289600>;
+		reset-gpios = <&gpio0 RK_PA0 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+};
+
+#include <arm/rk618.dtsi>
+
+&rk618_clkin {
+	clocks = <&cru SCLK_I2S1_OUT>;
+};
+
+&rk618_lcdc0_dclkp {
+	clocks = <&cru DCLK_VOPL>;
 };
 
 &io_domains {

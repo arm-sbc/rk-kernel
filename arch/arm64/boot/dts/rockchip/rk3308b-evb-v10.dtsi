@@ -242,7 +242,7 @@
 		compatible = "wlan-platdata";
 		rockchip,grf = <&grf>;
 		pinctrl-names = "default";
-		pinctrl-0 = <&wifi_wake_host>;
+		pinctrl-0 = <&wifi_wake_host>, <&rtc_32k>;
 		wifi_chip_type = "ap6255";
 		WIFI,host_wake_irq = <&gpio2 RK_PB4 GPIO_ACTIVE_HIGH>;
 		status = "okay";
@@ -266,6 +266,15 @@
 		status = "okay";
 	};
 	opp-1296000000 {
+		status = "okay";
+	};
+};
+
+&rk3308bs_cpu0_opp_table {
+	opp-1008000000 {
+		status = "okay";
+	};
+	opp-1104000000 {
 		status = "okay";
 	};
 };
@@ -672,9 +681,6 @@
 };
 
 &pinctrl {
-	pinctrl-names = "default";
-	pinctrl-0 = <&rtc_32k>;
-
 	buttons {
 		pwr_key: pwr-key {
 			rockchip,pins = <0 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
@@ -744,10 +750,6 @@
 &tsadc {
 	rockchip,hw-tshut-mode = <0>; /* tshut mode 0:CRU 1:GPIO */
 	rockchip,hw-tshut-polarity = <1>; /* tshut polarity 0:LOW 1:HIGH */
-	pinctrl-names = "init", "default", "sleep";
-	pinctrl-0 = <&tsadc_otp_gpio>;
-	pinctrl-1 = <&tsadc_otp_gpio>;
-	pinctrl-2 = <&tsadc_otp_gpio>;
 	status = "okay";
 };
 

@@ -35,6 +35,7 @@
 #include <linux/component.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
+#include <linux/gpio/consumer.h>
 
 #include <linux/reset.h>
 #include <linux/delay.h>
@@ -174,6 +175,7 @@ struct vop_plane_state {
 	bool r2r_en;
 	bool r2y_en;
 	int color_space;
+	int color_key;
 	unsigned int csc_mode;
 	bool enable;
 	int global_alpha;
@@ -208,6 +210,7 @@ struct vop_win {
 	struct vop *vop;
 
 	struct drm_property *rotation_prop;
+	struct drm_property *color_key_prop;
 	struct vop_plane_state state;
 };
 
@@ -261,6 +264,10 @@ struct vop {
 	void __iomem *cabc_lut_regs;
 	u32 cabc_lut_len;
 
+	void __iomem *bypass_wport_regs;
+	u32 bypass_wport_len;
+	struct gpio_desc *mcu_rs_gpio;
+
 	/* one time only one process allowed to config the register */
 	spinlock_t reg_lock;
 	/* lock vop irq reg */
@@ -288,6 +295,9 @@ struct vop {
 
 	struct vop_win win[];
 };
+
+static void vop_tv_config_update(struct drm_crtc *crtc,
+				 struct drm_crtc_state *old_crtc_state);
 
 static void vop_lock(struct vop *vop)
 {
@@ -521,6 +531,22 @@ static inline uint32_t vop_read_lut(struct vop *vop, uint32_t offset)
 	return readl(vop->lut_regs + offset);
 }
 
+static inline void vop_mcu_write_bypass_wport(struct vop *vop, uint32_t v)
+{
+	if (vop->bypass_wport_regs)
+		writel(v, vop->bypass_wport_regs);
+	else
+		VOP_CTRL_SET(vop, mcu_rw_bypass_port, v);
+}
+
+static inline void vop_mcu_set_rs(struct vop *vop, int v)
+{
+	if (vop->mcu_rs_gpio)
+		gpiod_set_value(vop->mcu_rs_gpio, v);
+	else
+		VOP_CTRL_SET(vop, mcu_rs, v);
+}
+
 static inline void vop_write_cabc_lut(struct vop *vop, uint32_t offset, uint32_t v)
 {
 	writel(v, vop->cabc_lut_regs + offset);
@@ -690,9 +716,26 @@ static void scl_vop_cal_scl_fac(struct vop *vop, struct vop_win *win,
 	uint32_t val;
 	int vskiplines = 0;
 	const struct vop_data *vop_data = vop->data;
+	struct drm_display_mode *adjusted_mode = &vop->crtc.state->adjusted_mode;
 
 	if (!win->phy->scl)
 		return;
+
+	/*
+	 * It is necessary for rk3036 win0/win1 and rk312x win0 to enable scaling when displaying
+	 * interlace mode. The scale factor should be an integer 2, so the calculation formula
+	 * need to be rewritten.
+	 */
+	if ((vop->version == VOP_VERSION(2, 2) || vop->version == VOP_VERSION(2, 4)) &&
+	    (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)) {
+		VOP_SCL_SET(vop, win, scale_yrgb_x, ((src_w << 12) / dst_w));
+		VOP_SCL_SET(vop, win, scale_yrgb_y, ((src_h << 12) / dst_h));
+		if (is_yuv) {
+			VOP_SCL_SET(vop, win, scale_cbcr_x, ((cbcr_src_w << 12) / dst_w));
+			VOP_SCL_SET(vop, win, scale_cbcr_y, ((cbcr_src_h << 12) / dst_h));
+		}
+		return;
+	}
 
 	if (!(vop_data->feature & VOP_FEATURE_ALPHA_SCALE)) {
 		if (is_alpha_support(pixel_format) &&
@@ -1650,6 +1693,68 @@ static void vop_plane_atomic_disable(struct drm_plane *plane,
 	vop_plane_state->enable = false;
 }
 
+static void vop_plane_setup_color_key(struct drm_plane *plane)
+{
+	struct drm_plane_state *pstate = plane->state;
+	struct vop_plane_state *vpstate = to_vop_plane_state(pstate);
+	struct drm_framebuffer *fb = pstate->fb;
+	struct vop_win *win = to_vop_win(plane);
+	struct vop *vop = win->vop;
+	uint32_t color_key_en = 0;
+	uint32_t color_key;
+	uint32_t r = 0;
+	uint32_t g = 0;
+	uint32_t b = 0;
+
+	if (!(vpstate->color_key & VOP_COLOR_KEY_MASK)) {
+		VOP_WIN_SET(vop, win, color_key_en, 0);
+		return;
+	}
+
+	switch (fb->pixel_format) {
+	case DRM_FORMAT_RGB565:
+	case DRM_FORMAT_BGR565:
+		r = (vpstate->color_key & 0xf800) >> 11;
+		g = (vpstate->color_key & 0x7e0) >> 5;
+		b = (vpstate->color_key & 0x1f);
+		if (VOP_WIN_SUPPORT(vop, win, fmt_10)) {
+			r <<= 5;
+			g <<= 4;
+			b <<= 5;
+		} else {
+			r <<= 3;
+			g <<= 2;
+			b <<= 3;
+		}
+		color_key_en = 1;
+		break;
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGB888:
+	case DRM_FORMAT_BGR888:
+		r = (vpstate->color_key & 0xff0000) >> 16;
+		g = (vpstate->color_key & 0xff00) >> 8;
+		b = (vpstate->color_key & 0xff);
+		if (VOP_WIN_SUPPORT(vop, win, fmt_10)) {
+			r <<= 2;
+			g <<= 2;
+			b <<= 2;
+		}
+		color_key_en = 1;
+		break;
+	}
+
+	if (VOP_WIN_SUPPORT(vop, win, fmt_10))
+		color_key = (r << 20) | (g << 10) | b;
+	else
+		color_key = (r << 16) | (g << 8) | b;
+
+	VOP_WIN_SET(vop, win, color_key_en, color_key_en);
+	VOP_WIN_SET(vop, win, color_key, color_key);
+}
+
 static void vop_plane_atomic_update(struct drm_plane *plane,
 		struct drm_plane_state *old_state)
 {
@@ -1658,12 +1763,14 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	struct drm_display_mode *mode = NULL;
 	struct vop_win *win = to_vop_win(plane);
 	struct vop_plane_state *vop_plane_state = to_vop_plane_state(state);
+	struct drm_display_mode *adjusted_mode = &crtc->state->adjusted_mode;
 	struct rockchip_crtc_state *s;
-	struct vop *vop;
+	struct vop *vop = to_vop(crtc);
 	struct drm_framebuffer *fb = state->fb;
 	unsigned int actual_w, actual_h;
 	unsigned int dsp_stx, dsp_sty;
 	uint32_t act_info, dsp_info, dsp_st, ex_vact_st, ex_vact_end;
+	uint32_t dest_height, dest_width;
 	struct drm_rect *src = &vop_plane_state->src;
 	struct drm_rect *dest = &vop_plane_state->dest;
 	const uint32_t *y2r_table = vop_plane_state->y2r_table;
@@ -1707,16 +1814,25 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 		return;
 	}
 
+	dest_height = drm_rect_height(dest);
+	if ((vop->version == VOP_VERSION(2, 2) || vop->version == VOP_VERSION(2, 4)) &&
+	    (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE))
+		dest_height = drm_rect_height(dest) / 2;
+	dest_width = drm_rect_width(dest);
+
 	mode = &crtc->state->adjusted_mode;
 	actual_w = drm_rect_width(src) >> 16;
 	actual_h = drm_rect_height(src) >> 16;
 	act_info = (actual_h - 1) << 16 | ((actual_w - 1) & 0xffff);
 
-	dsp_info = (drm_rect_height(dest) - 1) << 16;
-	dsp_info |= (drm_rect_width(dest) - 1) & 0xffff;
+	dsp_info = (dest_height - 1) << 16;
+	dsp_info |= (dest_width - 1) & 0xffff;
 
 	dsp_stx = dest->x1 + mode->crtc_htotal - mode->crtc_hsync_start;
 	dsp_sty = dest->y1 + mode->crtc_vtotal - mode->crtc_vsync_start;
+	if ((vop->version == VOP_VERSION(2, 2) || vop->version == VOP_VERSION(2, 4)) &&
+	    (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE))
+		dsp_sty = dest->y1 / 2 + mode->crtc_vtotal - mode->crtc_vsync_start;
 	dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
 	vop = to_vop(state->crtc);
 
@@ -1728,7 +1844,7 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 		else
 			ex_vact_st = dest->y1 + mode->crtc_vsync_end -
 				mode->crtc_vsync_start + 1;
-		ex_vact_end = ex_vact_st + drm_rect_height(dest);
+		ex_vact_end = ex_vact_st + dest_height;
 		VOP_WIN_SET(vop, win, vact_st_end_info,
 			    ex_vact_st << 16 | ex_vact_end);
 		VOP_WIN_SET(vop, win, data_type,
@@ -1758,7 +1874,7 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	VOP_WIN_SET(vop, win, fmt_10, is_yuv_10bit(fb->pixel_format));
 
 	scl_vop_cal_scl_fac(vop, win, actual_w, actual_h,
-			    drm_rect_width(dest), drm_rect_height(dest),
+			    drm_rect_width(dest), dest_height,
 			    fb->pixel_format);
 
 	VOP_WIN_SET(vop, win, act_info, act_info);
@@ -1805,6 +1921,9 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	}
 	VOP_WIN_SET(vop, win, global_alpha_val, vop_plane_state->global_alpha);
 
+	VOP_WIN_SET(vop, win, interlace_read,
+		    (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE) ? 1 : 0);
+
 	VOP_WIN_SET(vop, win, csc_mode, vop_plane_state->csc_mode);
 	if (win->csc) {
 		vop_load_csc_table(vop, win->csc->y2r_offset, y2r_table);
@@ -1815,6 +1934,10 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 		VOP_WIN_SET_EXT(vop, win, csc, r2y_en, vop_plane_state->r2y_en);
 		VOP_WIN_SET_EXT(vop, win, csc, csc_mode, vop_plane_state->csc_mode);
 	}
+
+	if (VOP_WIN_SUPPORT(vop, win, color_key))
+		vop_plane_setup_color_key(&win->base);
+
 	VOP_WIN_SET(vop, win, enable, 1);
 	VOP_WIN_SET(vop, win, gate, 1);
 	spin_unlock(&vop->reg_lock);
@@ -1960,6 +2083,11 @@ static int vop_atomic_plane_set_property(struct drm_plane *plane,
 		return 0;
 	}
 
+	if (property == win->color_key_prop) {
+		plane_state->color_key = val;
+		return 0;
+	}
+
 	DRM_ERROR("failed to set vop plane property\n");
 	return -EINVAL;
 }
@@ -2005,6 +2133,11 @@ static int vop_atomic_plane_get_property(struct drm_plane *plane,
 
 	if (property == private->pdaf_data_type) {
 		*val = plane_state->pdaf_data_type;
+		return 0;
+	}
+
+	if (property == win->color_key_prop) {
+		*val = plane_state->color_key;
 		return 0;
 	}
 
@@ -2513,13 +2646,13 @@ static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc,  u32 type, u32 value)
 	if (vop && vop->is_enabled) {
 		switch (type) {
 		case MCU_WRCMD:
-			VOP_CTRL_SET(vop, mcu_rs, 0);
-			VOP_CTRL_SET(vop, mcu_rw_bypass_port, value);
-			VOP_CTRL_SET(vop, mcu_rs, 1);
+			vop_mcu_set_rs(vop, 0);
+			vop_mcu_write_bypass_wport(vop, value);
+			vop_mcu_set_rs(vop, 1);
 			break;
 		case MCU_WRDATA:
-			VOP_CTRL_SET(vop, mcu_rs, 1);
-			VOP_CTRL_SET(vop, mcu_rw_bypass_port, value);
+			vop_mcu_set_rs(vop, 1);
+			vop_mcu_write_bypass_wport(vop, value);
 			break;
 		case MCU_SETBYPASS:
 			VOP_CTRL_SET(vop, mcu_bypass, value ? 1 : 0);
@@ -2633,7 +2766,7 @@ static void vop_update_csc(struct drm_crtc *crtc)
 	/*
 	 * Background color is 10bit depth if vop version >= 3.5
 	 */
-	if (!is_yuv_output(s->bus_format))
+	if (!is_yuv_output(s->bus_format) || !VOP_CTRL_SUPPORT(vop, overlay_mode))
 		val = 0;
 	else if (VOP_MAJOR(vop->version) == 3 && VOP_MINOR(vop->version) == 8 &&
 		 s->hdr.pre_overlay)
@@ -2873,7 +3006,8 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 
 	clk_set_rate(vop->dclk, adjusted_mode->crtc_clock * 1000);
 
-
+	if (!VOP_CTRL_SUPPORT(vop, overlay_mode))
+		vop_tv_config_update(crtc, &s->base);
 	vop_cfg_done(vop);
 
 	enable_irq(vop->irq);
@@ -3372,28 +3506,48 @@ static void vop_tv_config_update(struct drm_crtc *crtc,
 	}
 
 	if (vop_data->feature & VOP_FEATURE_OUTPUT_10BIT)
-		brightness = interpolate(0, -128, 100, 127,
-					 s->tv_state->brightness);
+		brightness = interpolate(0, -128, 100, 127, s->tv_state->brightness);
+	else if (VOP_MAJOR(vop->version) == 2 && VOP_MINOR(vop->version) == 6) /* px30 vopb */
+		brightness = interpolate(0, -64, 100, 63, s->tv_state->brightness);
 	else
-		brightness = interpolate(0, -32, 100, 31,
-					 s->tv_state->brightness);
-	contrast = interpolate(0, 0, 100, 511, s->tv_state->contrast);
-	saturation = interpolate(0, 0, 100, 511, s->tv_state->saturation);
-	hue = interpolate(0, -30, 100, 30, s->tv_state->hue);
+		brightness = interpolate(0, -32, 100, 31, s->tv_state->brightness);
 
-	/*
-	 *  a:[-30~0]:
-	 *    sin_hue = 0x100 - sin(a)*256;
-	 *    cos_hue = cos(a)*256;
-	 *  a:[0~30]
-	 *    sin_hue = sin(a)*256;
-	 *    cos_hue = cos(a)*256;
-	 */
-	sin_hue = fixp_sin32(hue) >> 23;
-	cos_hue = fixp_cos32(hue) >> 23;
+	if ((VOP_MAJOR(vop->version) == 3) ||
+	    (VOP_MAJOR(vop->version) == 2 && VOP_MINOR(vop->version) == 6)) { /* px30 vopb */
+		contrast = interpolate(0, 0, 100, 511, s->tv_state->contrast);
+		saturation = interpolate(0, 0, 100, 511, s->tv_state->saturation);
+		/*
+		 *  a:[-30~0]:
+		 *    sin_hue = 0x100 - sin(a)*256;
+		 *    cos_hue = cos(a)*256;
+		 *  a:[0~30]
+		 *    sin_hue = sin(a)*256;
+		 *    cos_hue = cos(a)*256;
+		 */
+		hue = interpolate(0, -30, 100, 30, s->tv_state->hue);
+		sin_hue = fixp_sin32(hue) >> 23;
+		cos_hue = fixp_cos32(hue) >> 23;
+		VOP_CTRL_SET(vop, bcsh_sat_con, saturation * contrast / 0x100);
+
+	} else {
+		contrast = interpolate(0, 0, 100, 255, s->tv_state->contrast);
+		saturation = interpolate(0, 0, 100, 255, s->tv_state->saturation);
+		/*
+		 *  a:[-30~0]:
+		 *    sin_hue = 0x100 - sin(a)*128;
+		 *    cos_hue = cos(a)*128;
+		 *  a:[0~30]
+		 *    sin_hue = sin(a)*128;
+		 *    cos_hue = cos(a)*128;
+		 */
+		hue = interpolate(0, -30, 100, 30, s->tv_state->hue);
+		sin_hue = fixp_sin32(hue) >> 24;
+		cos_hue = fixp_cos32(hue) >> 24;
+		VOP_CTRL_SET(vop, bcsh_sat_con, saturation * contrast / 0x80);
+	}
+
 	VOP_CTRL_SET(vop, bcsh_brightness, brightness);
 	VOP_CTRL_SET(vop, bcsh_contrast, contrast);
-	VOP_CTRL_SET(vop, bcsh_sat_con, saturation * contrast / 0x100);
 	VOP_CTRL_SET(vop, bcsh_sin_hue, sin_hue);
 	VOP_CTRL_SET(vop, bcsh_cos_hue, cos_hue);
 	VOP_CTRL_SET(vop, bcsh_out_mode, BCSH_OUT_MODE_NORMAL_VIDEO);
@@ -4081,6 +4235,10 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
 		drm_object_attach_property(&win->base.base,
 					   private->pdaf_data_type, 0x2a);
 
+	if (VOP_WIN_SUPPORT(vop, win, color_key))
+		drm_object_attach_property(&win->base.base,
+					   win->color_key_prop, 0);
+
 	return 0;
 }
 
@@ -4378,6 +4536,10 @@ static int vop_win_init(struct vop *vop)
 		vop_win->area_id = 0;
 		vop_win->zpos = vop_plane_get_zpos(win_data->type,
 						   vop_data->win_size);
+		if (VOP_WIN_SUPPORT(vop, vop_win, color_key))
+			vop_win->color_key_prop = drm_property_create_range(vop->drm_dev, 0,
+									    "colorkey", 0,
+									    0x80ffffff);
 
 		num_wins++;
 
@@ -4577,6 +4739,14 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 			return PTR_ERR(vop->lut_regs);
 	}
 
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "bypass_wport");
+	if (res) {
+		vop->bypass_wport_regs = devm_ioremap_resource(dev, res);
+		if (IS_ERR(vop->bypass_wport_regs))
+			return PTR_ERR(vop->bypass_wport_regs);
+		vop->bypass_wport_len = resource_size(res);
+	}
+
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cabc_lut");
 	if (res) {
 		vop->cabc_lut_len = resource_size(res) >> 2;
@@ -4671,6 +4841,12 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 			vop->mcu_timing.mcu_rw_pend = val;
 		if (!of_property_read_u32(mcu, "mcu-hold-mode", &val))
 			vop->mcu_timing.mcu_hold_mode = val;
+
+		vop->mcu_rs_gpio = devm_gpiod_get_optional(dev, "mcu-rs", GPIOD_OUT_LOW);
+		if (IS_ERR(vop->mcu_rs_gpio)) {
+			dev_err(dev, "failed to request mcu rs gpio\n");
+			return PTR_ERR(vop->mcu_rs_gpio);
+		}
 	}
 
 	return 0;

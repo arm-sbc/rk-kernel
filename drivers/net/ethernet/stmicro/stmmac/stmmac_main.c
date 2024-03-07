@@ -1811,8 +1811,6 @@ static int stmmac_open(struct net_device *dev)
 		goto init_error;
 	}
 
-	stmmac_check_ether_addr(priv);
-
 	ret = stmmac_hw_setup(dev, true);
 	if (ret < 0) {
 		pr_err("%s: Hw setup failed\n", __func__);
@@ -2957,6 +2955,8 @@ int stmmac_dvr_probe(struct device *device,
 	if (ret)
 		goto error_hw_init;
 
+	stmmac_check_ether_addr(priv);
+
 	ndev->netdev_ops = &stmmac_netdev_ops;
 
 	ndev->hw_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
@@ -3118,6 +3118,9 @@ int stmmac_suspend(struct device *dev)
 	} else {
 		stmmac_set_mac(priv->ioaddr, false);
 		pinctrl_pm_select_sleep_state(priv->device);
+		/* Make the phy into suspend state */
+		if (priv->mii)
+			stmmac_mdio_idle(priv->mii);
 		/* Disable clock in case of PWM is off */
 		clk_disable(priv->pclk);
 		clk_disable(priv->stmmac_clk);

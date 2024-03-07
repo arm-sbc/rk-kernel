@@ -33,6 +33,7 @@
 #define CMD_WRITE_EN            (0x06)
 #define CMD_WRITE_DIS           (0x04)
 #define CMD_PAGE_READ           (0x13)
+#define CMD_PAGE_FASTREAD4B     (0x0C)
 #define CMD_GET_FEATURE         (0x0F)
 #define CMD_SET_FEATURE         (0x1F)
 #define CMD_PROG_LOAD           (0x02)
@@ -59,6 +60,8 @@
 #define CMD_PAGE_PROG_X4        (0x32)
 /* X1 cmd, X4 addr, X4 data, SUPPORT MARCONIX */
 #define CMD_PAGE_PROG_A4        (0x38)
+/* X1 cmd, X4 addr, X4 data, SUPPORT MARCONIX */
+#define CMD_PAGE_PROG_4PP       (0x3E)
 #define CMD_RESET_NAND          (0xFF)
 #define CMD_ENTER_4BYTE_MODE    (0xB7)
 #define CMD_EXIT_4BYTE_MODE     (0xE9)
@@ -108,6 +111,7 @@ struct SFNOR_DEV {
 
 	enum SFC_DATA_LINES read_lines;
 	enum SFC_DATA_LINES prog_lines;
+	enum SFC_DATA_LINES prog_addr_lines;
 
 	SNOR_WRITE_STATUS write_status;
 	u32 max_iosize;
